@@ -110,8 +110,16 @@ def get_my_groups_from_schedule(token, teacher_id):
         print(f"  ❌ Неверный формат ответа")
         return []
     
+    # Фильтруем уроки-замены (учитель временно замещает, а не ведёт постоянно)
+    regular_lessons = [
+        item for item in data
+        if not item.get("replaced") and not item.get("replaced_teacher_id")
+    ]
+    if len(regular_lessons) < len(data):
+        print(f"  ⏳ Отфильтровано замен: {len(data) - len(regular_lessons)}")
+
     groups = {}
-    for item in data:
+    for item in regular_lessons:
         gid = item.get("group_id")
         gname = item.get("group_name","")
         subj = item.get("subject_name","")
