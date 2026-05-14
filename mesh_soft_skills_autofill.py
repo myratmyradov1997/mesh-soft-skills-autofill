@@ -13,7 +13,7 @@
   5. Скопируй значение заголовка Authorization: Bearer eyJ...
      (весь длинный текст после "Bearer ")
   6. Запусти скрипт: python3 mesh_soft_skills_autofill.py
-  7. Вставь токен и выбери группы для заполнения
+  7. Вставь токен — скрипт сам найдёт твои группы
 
 Зависимости: pip install requests
 """
@@ -23,7 +23,12 @@ import json
 import sys
 import time
 import hashlib
+import warnings
 from collections import defaultdict
+
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_URL = "https://school.mos.ru"
 
@@ -96,7 +101,7 @@ def get_answer(avg_score, question_id, person_id):
     thresholds = THRESHOLDS[category]
     offset = QUESTION_OFFSETS.get(question_id, 0)
 
-    # Персональная вариация (deteministic — одинаковая при каждом запуске)
+    # Персональная вариация (детерминированая — одинаковая при каждом запуске)
     seed = int(hashlib.md5(str(person_id).encode()).hexdigest()[:8], 16)
     person_var = ((seed + question_id * 100) % 500 - 250) / 1000
 
@@ -121,13 +126,13 @@ def make_headers(token):
         "Accept": "application/json",
         "X-Mes-Subsystem": "teacherweb",
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
     }
 
 
 def api_get(token, path, params=None):
     url = f"{BASE_URL}{path}"
-    resp = requests.get(url, headers=make_headers(token), params=params, timeout=30)
+    resp = requests.get(url, headers=make_headers(token), params=params, timeout=30, verify=False)
     if resp.status_code == 401:
         print("\n  ❌ Токен истёк или недействителен. Обнови страницу и скопируй новый.")
         sys.exit(1)
@@ -137,7 +142,7 @@ def api_get(token, path, params=None):
 
 def api_post(token, path, data):
     url = f"{BASE_URL}{path}"
-    resp = requests.post(url, headers=make_headers(token), json=data, timeout=30)
+    resp = requests.post(url, headers=make_headers(token), json=data, timeout=30, verify=False)
     return resp
 
 
@@ -202,6 +207,7 @@ def check_already_filled(token, person_id, period_id):
             headers=make_headers(token),
             params={"student_person_id": person_id, "period_id": period_id},
             timeout=10,
+            verify=False,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -210,6 +216,101 @@ def check_already_filled(token, person_id, period_id):
     except Exception:
         pass
     return False
+
+
+def get_my_groups(token):
+    """
+    Определяет группы учителя через отметки.
+    Возвращает список (group_id, group_name, subject_name).
+    """
+    # 1. Берём любую группу, чтобы узнать teacher_id и subject_id
+    all_groups = api_get(token, "/api/ej/plan/teacher/v1/groups",
+                         {"academic_year_id": 13, "page": 1, "per_page": 2000})
+
+    if not isinstance(all_groups, list):
+        all_groups = all_groups.get("items", all_groups.get("groups", []))
+
+    if not all_groups:
+        print("❌ Не найдено ни одной группы в школе.")
+        sys.exit(1)
+
+    # 2. Пробуем найти teacher_id и subject_id через первую группу с оценками
+    teacher_id = None
+    subject_id = None
+
+    for group in all_groups[:50]:  # проверяем первые 50 групп
+        gid = group.get("id")
+        try:
+            r = requests.get(
+                f"{BASE_URL}/api/ej/core/teacher/v1/marks",
+                headers=make_headers(token),
+                params={
+                    "group_ids": gid,
+                    "created_at_from": "01.09.2025",
+                    "created_at_to": "31.08.2026",
+                    "per_page": 1,
+                    "page": 1,
+                },
+                timeout=10,
+                verify=False,
+            )
+            if r.status_code == 200:
+                marks = r.json()
+                if isinstance(marks, list) and len(marks) > 0:
+                    teacher_id = marks[0].get("teacher_id")
+                    subject_id = marks[0].get("subject_id")
+                    if teacher_id and subject_id:
+                        break
+        except Exception:
+            continue
+
+    if not teacher_id or not subject_id:
+        print("❌ Не удалось определить teacher_id/subject_id.")
+        print("Убедитесь, что у вас есть оценки в журнале.")
+        sys.exit(1)
+
+    # 3. Получаем ВСЕ отметки этого учителя по этому предмету
+    all_marks = api_get(token, "/api/ej/core/teacher/v1/marks", {
+        "teacher_id": teacher_id,
+        "subject_id": subject_id,
+        "created_at_from": "01.09.2025",
+        "created_at_to": "31.08.2026",
+        "with_non_numeric_entries": "true",
+        "per_page": 10000,
+        "page": 1,
+    })
+
+    if not isinstance(all_marks, list):
+        print("❌ Не удалось загрузить отметки.")
+        sys.exit(1)
+
+    # 4. Извлекаем уникальные group_id
+    group_ids = set()
+    for mark in all_marks:
+        gid = mark.get("group_id")
+        if gid:
+            group_ids.add(gid)
+
+    if not group_ids:
+        print("❌ Не найдено групп с оценками. Возможно, у вас нет отметок в журнале.")
+        sys.exit(1)
+
+    # 5. Получаем названия групп
+    ids_str = ",".join(str(g) for g in sorted(group_ids))
+    groups_info = api_get(token, "/api/ej/plan/teacher/v1/groups",
+                          {"group_ids": ids_str, "academic_year_id": 13})
+
+    if not isinstance(groups_info, list):
+        groups_info = groups_info.get("items", groups_info.get("groups", []))
+
+    result = []
+    for g in groups_info:
+        gid = g.get("id")
+        name = g.get("group_name", g.get("name", "?"))
+        subj = g.get("subject_name", g.get("subject", ""))
+        result.append((gid, name, subj))
+
+    return sorted(result, key=lambda x: x[1])
 
 
 # ============================================================
@@ -229,82 +330,48 @@ def main():
         print("Токен не может быть пустым.")
         sys.exit(1)
 
-    # Проверка токена
-    print("\n⏳ Проверяю токен...")
-    try:
-        groups_data = api_get(token, "/api/ej/plan/teacher/v1/groups",
-                              {"academic_year_id": 13})
-    except Exception as e:
-        print(f"❌ Ошибка при проверке токена: {e}")
-        sys.exit(1)
+    # Проверка токена и получение групп
+    print("\n⏳ Определяю ваши группы через отметки...")
+    my_groups = get_my_groups(token)
 
-    all_groups = []
-    if isinstance(groups_data, list):
-        all_groups = groups_data
-    elif isinstance(groups_data, dict):
-        all_groups = groups_data.get("items", groups_data.get("groups", []))
+    print(f"\n✅ Найдено групп: {len(my_groups)}")
+    print("\n📚 ВАШИ ГРУППЫ:")
+    print("-" * 60)
+    for i, (gid, gname, subj) in enumerate(my_groups, 1):
+        print(f"  {i:2d}. [{gid}] {gname}")
 
-    if not all_groups:
-        print("❌ Не найдено ни одной группы. Проверьте токен.")
-        sys.exit(1)
-
-    # Группируем по предметам
-    subjects = defaultdict(list)
-    for g in all_groups:
-        name = g.get("group_name", g.get("name", ""))
-        subj = name.split()[0] if name else "?"
-        subjects[subj].append((g["id"], name))
-
-    print(f"\n✅ Токен работает. Найдено предметов: {len(subjects)}")
-
-    # 2. Выбираем группы
-    print("\n📚 ДОСТУПНЫЕ ПРЕДМЕТЫ И ГРУППЫ:")
-    print("-" * 70)
-    subj_list = sorted(subjects.keys())
-    for i, subj in enumerate(subj_list, 1):
-        groups = subjects[subj]
-        print(f"  {i:2d}. {subj} ({len(groups)} групп)")
-        for gid, gname in groups[:3]:
-            print(f"       [{gid}] {gname}")
-        if len(groups) > 3:
-            print(f"       ... и ещё {len(groups) - 3}")
-
+    # 2. Выбираем группы для заполнения
     print("\nВыберите группы для заполнения:")
-    print("  1 — выбрать по номеру предмета")
-    print("  2 — выбрать конкретные группы по ID")
-    print("  3 — заполнить все группы")
+    print("  1 — все группы")
+    print("  2 — выбрать по номерам")
+    print("  3 — ввести ID групп вручную")
     choice = input("Ваш выбор (1/2/3): ").strip()
 
     selected_groups = []
     if choice == "1":
-        nums = input("Введите номера предметов через пробел (например: 5 8 12): ").strip().split()
+        selected_groups = my_groups
+    elif choice == "2":
+        nums = input("Введите номера через пробел (например: 1 3 5): ").strip().split()
         for n in nums:
             try:
                 idx = int(n) - 1
-                if 0 <= idx < len(subj_list):
-                    subj = subj_list[idx]
-                    selected_groups.extend(subjects[subj])
+                if 0 <= idx < len(my_groups):
+                    selected_groups.append(my_groups[idx])
             except ValueError:
                 pass
-    elif choice == "2":
-        ids = input("Введите ID групп через запятую (например: 12345678,87654321): ").strip()
-        for part in ids.split(","):
+    elif choice == "3":
+        ids_input = input("Введите ID групп через запятую: ").strip()
+        for part in ids_input.split(","):
             gid = part.strip()
             if gid.isdigit():
                 found = False
-                for subj in subj_list:
-                    for sgid, sname in subjects[subj]:
-                        if str(sgid) == gid:
-                            selected_groups.append((sgid, sname))
-                            found = True
-                            break
-                    if found:
+                for sgid, sname, subj in my_groups:
+                    if str(sgid) == gid:
+                        selected_groups.append((sgid, sname, subj))
+                        found = True
                         break
                 if not found:
                     print(f"  ⚠️ Группа {gid} не найдена")
-    elif choice == "3":
-        for subj in subj_list:
-            selected_groups.extend(subjects[subj])
     else:
         print("Неверный выбор.")
         sys.exit(1)
@@ -322,7 +389,7 @@ def main():
     skipped = 0
     failed = 0
 
-    for gid, gname in selected_groups:
+    for gid, gname, subj in selected_groups:
         print(f"\n📁 [{gid}] {gname}")
 
         # Получаем учеников
@@ -348,7 +415,7 @@ def main():
         print(f"  👥 {len(valid)} учеников")
 
         # Получаем оценки
-        student_ids = {s["id"] for s in valid}
+        student_ids_set = {s["id"] for s in valid}
         try:
             marks = api_get(token, "/api/ej/core/teacher/v1/marks", {
                 "group_ids": gid,
@@ -358,7 +425,7 @@ def main():
                 "per_page": 3000,
                 "page": 1,
             })
-            averages = compute_averages(marks, student_ids)
+            averages = compute_averages(marks, student_ids_set)
         except Exception as e:
             print(f"  ⚠️ Ошибка загрузки оценок: {e}")
             averages = {}
@@ -366,7 +433,7 @@ def main():
         # Получаем period_id
         period_id = get_period_id(token, valid[0]["person_id"])
         if not period_id:
-            print(f"  ⚠️ Не удалось определить period")
+            print(f"  ⚠️ Не удалось определить period_id для этой группы")
             for s in valid:
                 all_results.append({
                     "group": gname, "name": get_student_name(s),
@@ -388,17 +455,18 @@ def main():
             # Пропускаем, если уже заполнено
             if check_already_filled(token, s["person_id"], period_id):
                 skipped += 1
-                print(f"  ⏭️ {name} — уже заполнено")
                 continue
 
             # Отправляем
-            ans_list = [{"question_id": q, "answer_id": answers[q]} for q in sorted(answers.keys())]
+            ans_list = [{"question_id": q, "answer_id": answers[q]} for q in ["1","2","3","4","5","6","7","11","13","14"]]
+            resp_ok = False
             try:
                 resp = api_post(token, "/api/soft_skills/v1/survey", {
                     "student_person_id": s["person_id"],
                     "period_id": period_id,
                     "answers": ans_list,
                 })
+                resp_ok = resp.ok
                 if resp.ok:
                     success += 1
                 else:
@@ -408,18 +476,16 @@ def main():
                 failed += 1
                 print(f"  ❌ {name} — {str(e)[:50]}")
 
-            # Сохраняем в результат
             all_results.append({
                 "group": gname,
                 "name": name,
-                "person_id": s["person_id"],
                 "period_id": period_id,
                 "avg": round(avg, 2) if avg else None,
                 "answers": answers,
             })
 
-            print(f"  {'✅' if resp.ok else '❌'} {name} (балл: {avg:.2f if avg else 'N/A'})")
-            time.sleep(0.3)
+            print(f"  {'✅' if resp_ok else '❌'} {name} (балл: {avg:.2f if avg else 'N/A'})")
+            time.sleep(0.2)
 
         total_students += len(valid)
 
