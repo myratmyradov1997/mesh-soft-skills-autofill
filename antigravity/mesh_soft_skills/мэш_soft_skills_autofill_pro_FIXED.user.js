@@ -481,7 +481,8 @@
                     id: gid,
                     group_name: item.group_name || `Группа ${gid}`,
                     subject_id: item.subject_id,
-                    subject_name: item.subject_name || ''
+                    subject_name: item.subject_name || '',
+                    class_unit_id: item.class_unit_id || null
                 };
             }
         }
@@ -493,23 +494,56 @@
         const ayId = getAcademicYearId();
         addLog(`[Groups] academic_year_id=${ayId}`, 'info');
         const pid = await getProfileId();
+
+        // Пробуем сначала schedule_items → группа с group_id и class_unit_id
+        let groupsFromSchedule = [];
         if (pid) {
             try {
                 const sched = await apiFetch(`/api/ej/plan/teacher/v1/schedule_items?academic_year_id=${ayId}&teacher_id=${pid}&from=2025-09-01&to=2026-05-31&with_group_class_subject_info=true&page=1&per_page=2000`);
-                const groups = extractGroupsFromSchedule(sched, pid);
-                if (groups.length > 0) return groups;
+                groupsFromSchedule = extractGroupsFromSchedule(sched, pid);
+                addLog(`[Groups] Из расписания: ${groupsFromSchedule.length} групп (с class_unit_id)`, 'info');
             } catch (e2) {
                 addLog(`[Groups] Расписание не сработало: ${e2.message}`, 'warning');
             }
         }
 
-        // Запасной вариант — все группы учителя
+        // Запасной вариант — /groups (могут быть другие ID)
+        let groupsFromApi = [];
         try {
-            const data = await apiFetch(`/api/ej/plan/teacher/v1/groups?academic_year_id=${ayId}`);
-            return Array.isArray(data) ? data : (data.items || data.groups || []);
+            const data = await apiFetch(`/api/ej/plan/teacher/v1/groups?academic_year_id=${ayId}`, {}, true);
+            groupsFromApi = Array.isArray(data) ? data : (data.items || data.groups || []);
+            addLog(`[Groups] Из /groups: ${groupsFromApi.length} групп`, 'info');
         } catch (e) {
-            throw e;
+            addLog(`[Groups] /groups не сработал: ${e.message}`, 'warning');
         }
+
+        // Слияние: если /groups дала результат с другими ID — используем их
+        if (groupsFromApi.length > groupsFromSchedule.length) {
+            addLog(`[Groups] Используем /groups (${groupsFromApi.length} > ${groupsFromSchedule.length})`, 'info');
+            const merged = groupsFromApi.map(g => ({
+                id: g.id || g.group_id,
+                group_name: g.name || g.group_name || g.class_name || `Группа ${g.id}`,
+                subject_id: g.subject_id,
+                subject_name: g.subject_name || '',
+                class_unit_id: g.class_unit_id || null
+            })).filter(g => g.id);
+            // Добавляем группы из расписания, которых нет в /groups (по subject)
+            const existingKeys = new Set(merged.map(g => `${g.id}-${g.subject_id}`));
+            for (const g of groupsFromSchedule) {
+                const key = `${g.id}-${g.subject_id}`;
+                if (!existingKeys.has(key)) {
+                    merged.push(g);
+                    existingKeys.add(key);
+                }
+            }
+            return merged;
+        }
+
+        // По умолчанию — из расписания
+        if (groupsFromSchedule.length > 0) return groupsFromSchedule;
+        if (groupsFromApi.length > 0) return groupsFromApi;
+
+        throw new Error('Не удалось загрузить группы');
     }
 
     // === ЛОГИКА ОЦЕНКИ ===
@@ -1393,7 +1427,8 @@
         let options = '';
         state.groups.forEach(g => {
             const isSelected = (urlClassId && String(g.id) === urlClassId) ? 'selected' : '';
-            options += `<option value="${g.id}" ${isSelected}>[${g.id}] ${g.group_name || g.name} (${g.subject_name || 'нет предмета'})</option>`;
+            const cu = g.class_unit_id ? ` cu=${g.class_unit_id}` : '';
+            options += `<option value="${g.id}" ${isSelected}>[${g.id}]${cu} ${g.group_name || g.name} (${g.subject_name || 'нет предмета'})</option>`;
         });
         select.innerHTML = options;
     }
@@ -1416,71 +1451,117 @@
         const ayId = getAcademicYearId();
         addLog(`Используется academic_year_id: ${ayId}`);
 
-        // Пробуем разные academic_year_id
+        // Находим class_unit_id для этой группы (если есть)
+        const groupInfo = state.groups.find(g => String(g.id) === String(groupId));
+        const classUnitId = groupInfo ? groupInfo.class_unit_id : null;
+        addLog(`Группа: id=${groupId}, class_unit_id=${classUnitId || '—'}`, 'info');
+
+        // Какие идентификаторы группы пробовать
+        const groupIdCandidates = [groupId];
+        if (classUnitId && String(classUnitId) !== String(groupId)) {
+            groupIdCandidates.push(String(classUnitId));
+        }
+
+        // Какие academic_year_id пробовать
         const ayCandidates = [ayId, '14', '15', '12', '16', '11', '13'];
-        const tried = new Set();
 
         let validStudents = [];
         let marksData = null;
         let schoolYearUsed = null;
+        let groupIdUsed = null;
 
-        for (const currentAy of ayCandidates) {
-            if (tried.has(currentAy)) continue;
-            tried.add(currentAy);
+        for (const gid of groupIdCandidates) {
+            if (validStudents.length > 0) break;
+            for (const currentAy of ayCandidates) {
+                if (validStudents.length > 0) break;
 
-            addLog(`[Попытка] academic_year_id=${currentAy} для student_profiles...`);
-            
-            try {
-                const url = `/api/ej/core/teacher/v1/student_profiles?academic_year_id=${currentAy}&group_ids=${groupId}&with_final_marks=true&per_page=150&page=1`;
-                addLog(`[API] URL: ${CONFIG.apiBase}${url}`, 'info');
-                
-                const studentsData = await apiFetch(url, {}, false);
+                addLog(`[Попытка] group_id=${gid}, academic_year_id=${currentAy}...`);
 
-                // Логируем полный ответ
-                addLog(`[DEBUG] Тип ответа: ${Array.isArray(studentsData) ? 'array' : typeof studentsData}`, 'info');
-                addLog(`[DEBUG] Ответ (первые 300 символов): ${JSON.stringify(studentsData).substring(0, 300)}`, 'info');
-                if (typeof studentsData === 'object' && studentsData !== null) {
-                    addLog(`[DEBUG] Ключи: ${Object.keys(studentsData).join(', ')}`, 'info');
-                }
+                try {
+                    const url = `/api/ej/core/teacher/v1/student_profiles?academic_year_id=${currentAy}&group_ids=${gid}&with_final_marks=true&per_page=150&page=1`;
+                    addLog(`[API] URL: ${CONFIG.apiBase}${url}`, 'info');
 
-                let profiles = [];
-                if (Array.isArray(studentsData)) {
-                    profiles = studentsData;
-                } else if (studentsData && typeof studentsData === 'object') {
-                    for (const key of Object.keys(studentsData)) {
-                        if (Array.isArray(studentsData[key])) {
-                            profiles = studentsData[key];
-                            addLog(`[DEBUG] Найден массив в поле '${key}' — ${profiles.length} элементов`, 'info');
-                            if (profiles.length > 0) {
-                                addLog(`[DEBUG] Ключи элемента: ${Object.keys(profiles[0]).join(', ')}`, 'info');
+                    const studentsData = await apiFetch(url, {}, false);
+
+                    if (Array.isArray(studentsData)) {
+                        addLog(`[DEBUG] Ответ: массив[${studentsData.length}]`, 'info');
+                        validStudents = studentsData.filter(s => s && (s.id || s.person_id || s.student_id));
+                    } else if (studentsData && typeof studentsData === 'object') {
+                        const keys = Object.keys(studentsData);
+                        addLog(`[DEBUG] Ответ: объект{${keys.join(',')}}`, 'info');
+                        for (const key of keys) {
+                            if (Array.isArray(studentsData[key])) {
+                                addLog(`[DEBUG] Поле '${key}' → массив[${studentsData[key].length}]`, 'info');
+                                validStudents = studentsData[key].filter(s => s && (s.id || s.person_id || s.student_id));
+                                if (validStudents.length > 0) break;
                             }
-                            break;
+                        }
+                    } else {
+                        addLog(`[DEBUG] Ответ: ${JSON.stringify(studentsData).substring(0, 200)}`, 'info');
+                    }
+
+                    if (validStudents.length > 0) {
+                        schoolYearUsed = currentAy;
+                        groupIdUsed = gid;
+                        addLog(`✅ group_id=${gid}, ay=${currentAy} → ${validStudents.length} учеников`, 'success');
+                        if (validStudents.length > 0 && validStudents[0]) {
+                            addLog(`[DEBUG] Первый ученик: ${JSON.stringify(validStudents[0]).substring(0, 300)}`, 'info');
+                        }
+                        break;
+                    } else {
+                        addLog(`❌ group_id=${gid}, ay=${currentAy} — 0 учеников`, 'warning');
+                        // Если массив пуст — показываем хотя бы первые 100 символов ответа
+                        const raw = JSON.stringify(studentsData);
+                        if (raw.length < 100) {
+                            addLog(`[DEBUG] Содержимое: ${raw}`, 'info');
                         }
                     }
+                } catch (e) {
+                    addLog(`❌ group_id=${gid}, ay=${currentAy} — ошибка: ${e.message.substring(0, 100)}`, 'warning');
                 }
-
-                validStudents = profiles.filter(s => s && (s.id || s.person_id || s.student_id));
-
-                if (validStudents.length > 0) {
-                    schoolYearUsed = currentAy;
-                    addLog(`✅ academic_year_id=${currentAy} → ${validStudents.length} учеников`, 'success');
-                    break;
-                } else {
-                    addLog(`❌ academic_year_id=${currentAy} — 0 учеников (profiles=${profiles.length})`, 'warning');
-                    if (profiles.length > 0) {
-                        addLog(`[DEBUG] Первый элемент: ${JSON.stringify(profiles[0]).substring(0, 300)}`, 'warning');
-                    }
-                }
-            } catch (e) {
-                addLog(`❌ academic_year_id=${currentAy} — ошибка: ${e.message.substring(0, 100)}`, 'warning');
             }
         }
 
         if (validStudents.length === 0) {
-            addLog('👎 Не удалось найти учеников ни с одним academic_year_id.', 'error');
-            addLog('Проверьте: 1) ID группы корректен 2) В настройках можно указать academic_year_id вручную', 'info');
+            addLog('👎 Не удалось найти учеников.', 'error');
+            addLog('Возможные причины:', 'info');
+            addLog('1) ID группы из расписания отличается от ID в student_profiles', 'info');
+            addLog('2) Попробуйте изменить academic_year_id в Настройках', 'info');
+            addLog('3) Для диагностики: откройте вкладку Network, найдите student_profiles в запросах, проверьте ответ', 'info');
+
+            // Последняя попытка: raw-запрос к /groups для поиска правильного group_id по имени группы
+            if (groupInfo && groupInfo.group_name) {
+                addLog(`[RAW] Пробую /groups напрямую для "${groupInfo.group_name}"...`, 'warning');
+                try {
+                    const rawData = await apiFetchRaw(`/api/ej/plan/teacher/v1/groups?academic_year_id=${ayId}`);
+                    if (rawData) {
+                        const arr = Array.isArray(rawData) ? rawData : (rawData.items || rawData.groups || []);
+                        addLog(`[RAW] /groups вернул ${arr.length} групп`, 'info');
+                        const match = arr.find(g => {
+                            const gn = g.name || g.group_name || '';
+                            return gn.includes(groupInfo.group_name) || gn.includes(groupInfo.subject_name || '');
+                        });
+                        if (match) {
+                            addLog(`[RAW] Найдена группа: id=${match.id}, name=${match.group_name || match.name}`, 'success');
+                            addLog(`[RAW] Попробуйте выбрать вручную group_id=${match.id} из выпадающего списка`, 'info');
+                        }
+                        // Показываем пару похожих групп
+                        const similar = arr.filter(g => {
+                            const gn = g.name || g.group_name || '';
+                            const sn = g.subject_name || '';
+                            return gn.includes('5') || sn.includes(groupInfo.subject_name || '');
+                        }).slice(0, 3);
+                        if (similar.length > 0) {
+                            addLog(`[RAW] Похожие группы: ${similar.map(g => `id=${g.id} name=${g.group_name || g.name}`).join('; ')}`, 'info');
+                        }
+                    }
+                } catch (e) {
+                    addLog(`[RAW] /groups ошибка: ${e.message}`, 'error');
+                }
+            }
             return;
         }
+        addLog(`Использовано: group_id=${groupIdUsed}, school_year=${schoolYearUsed}`);
 
         addLog(`Найдено учеников: ${validStudents.length}`);
 
