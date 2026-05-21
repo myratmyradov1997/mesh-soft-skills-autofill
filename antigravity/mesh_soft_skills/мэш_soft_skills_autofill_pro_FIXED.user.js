@@ -1345,11 +1345,51 @@
             // 1. Загрузка учеников класса
             addLog('Загружаю список учеников...');
             const studentsData = await apiFetch(`/api/ej/core/teacher/v1/student_profiles?academic_year_id=13&group_ids=${groupId}&with_final_marks=true&per_page=150&page=1`);
-            const profiles = studentsData.items || studentsData || [];
-            const validStudents = profiles.filter(s => s.person_id);
+
+            // Логируем структуру ответа
+            if (studentsData && typeof studentsData === 'object') {
+                if (Array.isArray(studentsData)) {
+                    addLog(`[DEBUG] Ответ student_profiles — массив из ${studentsData.length} элементов`, 'info');
+                    if (studentsData.length > 0) {
+                        addLog(`[DEBUG] Ключи первого элемента: ${Object.keys(studentsData[0]).join(', ')}`, 'info');
+                        addLog(`[DEBUG] Имеет person_id: ${!!studentsData[0].person_id}, id: ${!!studentsData[0].id}, student_id: ${!!studentsData[0].student_id}`, 'info');
+                    }
+                } else {
+                    const keys = Object.keys(studentsData);
+                    addLog(`[DEBUG] Ответ student_profiles — объект {${keys.join(', ')}}`, 'info');
+                    keys.forEach(k => {
+                        if (Array.isArray(studentsData[k])) {
+                            addLog(`[DEBUG] Поле '${k}' — массив из ${studentsData[k].length} элементов`, 'info');
+                        }
+                    });
+                }
+            }
+
+            let profiles = [];
+            if (Array.isArray(studentsData)) {
+                profiles = studentsData;
+            } else if (studentsData && studentsData.items && Array.isArray(studentsData.items)) {
+                profiles = studentsData.items;
+            } else if (studentsData && studentsData.students && Array.isArray(studentsData.students)) {
+                profiles = studentsData.students;
+            } else if (studentsData && typeof studentsData === 'object') {
+                for (const key of Object.keys(studentsData)) {
+                    if (Array.isArray(studentsData[key]) && studentsData[key].length > 0 && typeof studentsData[key][0] === 'object') {
+                        profiles = studentsData[key];
+                        addLog(`[DEBUG] Найден массив учеников в поле '${key}'`, 'info');
+                        break;
+                    }
+                }
+            }
+
+            // Безопасная фильтрация — не только по person_id
+            const validStudents = profiles.filter(s => s && (s.id || s.person_id || s.student_id));
 
             if (validStudents.length === 0) {
-                addLog('В группе не найдено учеников.', 'error');
+                addLog(`В группе не найдено учеников. Всего профилей: ${profiles.length}`, 'error');
+                if (profiles.length > 0) {
+                    addLog(`[DEBUG] Первый профиль: ${JSON.stringify(profiles[0]).substring(0, 200)}`, 'error');
+                }
                 return;
             }
             addLog(`Загружено учеников: ${validStudents.length}`);
@@ -1365,7 +1405,7 @@
 
             // 3. Выбор period_id
             addLog('Определяю текущий период для soft skills...');
-            const firstPersonId = validStudents[0].person_id;
+            const firstPersonId = validStudents[0].person_id || validStudents[0].id;
             const periodId = await getPeriodId(firstPersonId);
             
             if (!periodId) {
@@ -1389,12 +1429,12 @@
                     else if (cat === 'self_reg') qId = 5;
                     else if (cat === 'comm') qId = 11;
                     
-                    answers[cat] = getAnswerByScore(avg, qId, s.person_id);
+                    answers[cat] = getAnswerByScore(avg, qId, s.person_id || s.id);
                 });
 
                 studentsList.push({
                     id: s.id,
-                    person_id: s.person_id,
+                    person_id: s.person_id || s.id,
                     name: name,
                     avg: avg,
                     answers: answers,
@@ -1414,19 +1454,40 @@
 
     function computeAverages(marksData, studentIds) {
         const scores = {};
-        const items = Array.isArray(marksData) ? marksData : (marksData.marks || marksData.items || []);
+        let items = [];
+        if (Array.isArray(marksData)) {
+            items = marksData;
+        } else if (marksData && marksData.marks && Array.isArray(marksData.marks)) {
+            items = marksData.marks;
+        } else if (marksData && marksData.items && Array.isArray(marksData.items)) {
+            items = marksData.items;
+        } else if (marksData && typeof marksData === 'object') {
+            for (const key of Object.keys(marksData)) {
+                if (Array.isArray(marksData[key])) {
+                    items = marksData[key];
+                    addLog(`[DEBUG marks] Найден массив в поле '${key}' (${items.length} элементов)`, 'info');
+                    break;
+                }
+            }
+        }
+        addLog(`[DEBUG marks] Всего оценок в ответе: ${items.length}`, 'info');
         
         for (const mark of items) {
             const sid = mark.student_profile_id || mark.student_id;
-            if (!studentIds.includes(String(sid))) continue;
+            if (!sid || !studentIds.includes(String(sid))) continue;
             
             try {
                 let val = null;
+                // Попытка 1: values[0].grade.five
                 if (mark.values && mark.values[0] && mark.values[0].grade) {
-                    val = mark.values[0].grade.five;
+                    if (mark.values[0].grade.five != null) val = mark.values[0].grade.five;
+                    else if (mark.values[0].grade.value != null) val = mark.values[0].grade.value;
                 }
+                // Попытка 2: mark.name или mark.value (как число)
                 if (val == null) {
-                    val = parseFloat(mark.name || mark.value);
+                    const raw = mark.name ?? mark.value;
+                    if (typeof raw === 'number') val = raw;
+                    else if (typeof raw === 'string') val = parseFloat(raw);
                 }
                 if (val != null && val >= 2 && val <= 5) {
                     if (!scores[sid]) scores[sid] = [];
