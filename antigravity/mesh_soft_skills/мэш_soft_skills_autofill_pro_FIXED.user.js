@@ -137,7 +137,8 @@
             13: 0.25,  // Коммуникация: вежливость
             14: -0.30  // Коммуникация: выступления
         },
-        apiBase: 'https://school.mos.ru'
+        apiBase: 'https://school.mos.ru',
+        academicYearId: null
     };
 
     let CONFIG = loadSettings();
@@ -151,7 +152,8 @@
                     return {
                         thresholds: { ...DEFAULT_CONFIG.thresholds, ...(parsed.thresholds || {}) },
                         offsets: { ...DEFAULT_CONFIG.offsets, ...(parsed.offsets || {}) },
-                        apiBase: DEFAULT_CONFIG.apiBase
+                        apiBase: DEFAULT_CONFIG.apiBase,
+                        academicYearId: parsed.academicYearId || null
                     };
                 }
             }
@@ -164,8 +166,14 @@
     function saveSettings() {
         setStorageItem('mss_pro_config', JSON.stringify({
             thresholds: CONFIG.thresholds,
-            offsets: CONFIG.offsets
+            offsets: CONFIG.offsets,
+            academicYearId: CONFIG.academicYearId
         }));
+    }
+
+    function getAcademicYearId() {
+        if (CONFIG.academicYearId) return CONFIG.academicYearId;
+        return '13';
     }
 
     const QUESTION_CATEGORY = {
@@ -367,7 +375,7 @@
     }
 
     // === СЕТЕВЫЕ ЗАПРОСЫ К МЭШ ===
-    async function apiFetch(path, opts = {}) {
+    async function apiFetch(path, opts = {}, silent = false) {
         scanStorageForCredentials();
         await getProfileId();
 
@@ -386,19 +394,71 @@
             headers['Profile-Id'] = String(authState.profileId);
         }
 
+        if (!silent) {
+            addLog(`[API] → ${path.substring(0, 100)}`, 'info');
+        }
+
         const resp = await fetch(url, {
             credentials: 'include',
             headers,
             ...opts,
         });
 
+        if (!silent) {
+            addLog(`[API] ← статус ${resp.status} (${path.substring(0, 60)})`, resp.status === 200 ? 'info' : 'warning');
+        }
+
         if (resp.status === 401) {
             throw new Error('Сессия истекла (401). Пожалуйста, обновите страницу.');
         }
         if (!resp.ok) {
-            throw new Error(`Ошибка HTTP ${resp.status} для запроса: ${path}`);
+            let body = '';
+            try { body = await resp.text(); } catch (e) {}
+            throw new Error(`HTTP ${resp.status} для ${path}: ${body.substring(0, 200)}`);
         }
-        return resp.json();
+        
+        let json;
+        try {
+            json = await resp.json();
+        } catch (e) {
+            const text = await resp.text().catch(() => '');
+            addLog(`[API] ⚠️ Ответ не JSON: ${text.substring(0, 300)}`, 'error');
+            throw new Error(`Не JSON ответ от ${path}: ${text.substring(0, 100)}`);
+        }
+        
+        if (!silent && json && typeof json === 'object') {
+            if (Array.isArray(json)) {
+                addLog(`[API] ← массив[${json.length}]`, 'info');
+            } else {
+                const keys = Object.keys(json).slice(0, 8);
+                addLog(`[API] ← объект{${keys.join(',')}${Object.keys(json).length > 8 ? '…' : ''}}`, 'info');
+            }
+        }
+        
+        return json;
+    }
+
+    // Версия apiFetch, которая логирует даже при ошибках
+    async function apiFetchRaw(path) {
+        scanStorageForCredentials();
+        await getProfileId();
+        const url = path.startsWith('http') ? path : CONFIG.apiBase + path;
+        const headers = {
+            'Accept': 'application/json',
+            'X-Mes-Subsystem': 'teacherweb',
+            'Content-Type': 'application/json',
+        };
+        if (authState.token) headers['Authorization'] = `Bearer ${authState.token}`;
+        if (authState.profileId) headers['Profile-Id'] = String(authState.profileId);
+        try {
+            const resp = await fetch(url, { credentials: 'include', headers });
+            const text = await resp.text();
+            addLog(`[API RAW] ${resp.status} ${path.substring(0, 80)} → ${text.substring(0, 500)}`, resp.status === 200 ? 'info' : 'warning');
+            try { return JSON.parse(text); } catch (e) { return null; }
+        } catch (e) {
+            addLog(`[API RAW] Ошибка: ${e.message}`, 'error');
+            return null;
+        }
     }
 
     function extractGroupsFromSchedule(sched, profileId) {
@@ -430,20 +490,22 @@
 
     // Получить список классов учителя
     async function fetchMyGroups() {
+        const ayId = getAcademicYearId();
+        addLog(`[Groups] academic_year_id=${ayId}`, 'info');
         const pid = await getProfileId();
         if (pid) {
             try {
-                const sched = await apiFetch(`/api/ej/plan/teacher/v1/schedule_items?academic_year_id=13&teacher_id=${pid}&from=2025-09-01&to=2026-05-31&with_group_class_subject_info=true&page=1&per_page=2000`);
+                const sched = await apiFetch(`/api/ej/plan/teacher/v1/schedule_items?academic_year_id=${ayId}&teacher_id=${pid}&from=2025-09-01&to=2026-05-31&with_group_class_subject_info=true&page=1&per_page=2000`);
                 const groups = extractGroupsFromSchedule(sched, pid);
                 if (groups.length > 0) return groups;
             } catch (e2) {
-                console.warn('Не удалось получить группы через расписание:', e2);
+                addLog(`[Groups] Расписание не сработало: ${e2.message}`, 'warning');
             }
         }
 
         // Запасной вариант — все группы учителя
         try {
-            const data = await apiFetch('/api/ej/plan/teacher/v1/groups?academic_year_id=13');
+            const data = await apiFetch(`/api/ej/plan/teacher/v1/groups?academic_year_id=${ayId}`);
             return Array.isArray(data) ? data : (data.items || data.groups || []);
         } catch (e) {
             throw e;
@@ -1105,6 +1167,10 @@
                         <label style="font-weight:600; font-size:11px; color:#555;">Profile ID:</label>
                         <input type="text" id="mss-profile-id-input" class="mss-input" style="font-family:monospace; font-size:11px; padding:6px 10px;" value="${authState.profileId || ''}" placeholder="Захватывается автоматически. Можно вставить вручную.">
                     </div>
+                    <div class="mss-form-group">
+                        <label style="font-weight:600; font-size:11px; color:#555;">Academic Year ID (уч. год):</label>
+                        <input type="text" id="mss-ayid-input" class="mss-input" style="font-family:monospace; font-size:11px; padding:6px 10px;" value="${CONFIG.academicYearId || ''}" placeholder="Обычно 13. Если ученики не находятся — попробуйте 14, 12, 15.">
+                    </div>
                 </div>
 
                 <div class="mss-section-title" style="margin-bottom:8px;">Пороги оценок</div>
@@ -1243,6 +1309,12 @@
             else removeStorageItem('mss_captured_profile_id');
         }
 
+        const ayIdInput = document.getElementById('mss-ayid-input');
+        if (ayIdInput) {
+            const val = ayIdInput.value.trim();
+            CONFIG.academicYearId = val || null;
+        }
+
         const sliders = content.querySelectorAll('.mss-slider');
         sliders.forEach(slider => {
             const cat = slider.getAttribute('data-cat');
@@ -1341,115 +1413,131 @@
         switchTab('logs');
         addLog(`=== НАЧАЛО АНАЛИЗА КЛАССА [${groupId}] ===`);
 
-        try {
-            // 1. Загрузка учеников класса
-            addLog('Загружаю список учеников...');
-            const studentsData = await apiFetch(`/api/ej/core/teacher/v1/student_profiles?academic_year_id=13&group_ids=${groupId}&with_final_marks=true&per_page=150&page=1`);
+        const ayId = getAcademicYearId();
+        addLog(`Используется academic_year_id: ${ayId}`);
 
-            // Логируем структуру ответа
-            if (studentsData && typeof studentsData === 'object') {
-                if (Array.isArray(studentsData)) {
-                    addLog(`[DEBUG] Ответ student_profiles — массив из ${studentsData.length} элементов`, 'info');
-                    if (studentsData.length > 0) {
-                        addLog(`[DEBUG] Ключи первого элемента: ${Object.keys(studentsData[0]).join(', ')}`, 'info');
-                        addLog(`[DEBUG] Имеет person_id: ${!!studentsData[0].person_id}, id: ${!!studentsData[0].id}, student_id: ${!!studentsData[0].student_id}`, 'info');
-                    }
-                } else {
-                    const keys = Object.keys(studentsData);
-                    addLog(`[DEBUG] Ответ student_profiles — объект {${keys.join(', ')}}`, 'info');
-                    keys.forEach(k => {
-                        if (Array.isArray(studentsData[k])) {
-                            addLog(`[DEBUG] Поле '${k}' — массив из ${studentsData[k].length} элементов`, 'info');
-                        }
-                    });
-                }
-            }
+        // Пробуем разные academic_year_id
+        const ayCandidates = [ayId, '14', '15', '12', '16', '11', '13'];
+        const tried = new Set();
 
-            let profiles = [];
-            if (Array.isArray(studentsData)) {
-                profiles = studentsData;
-            } else if (studentsData && studentsData.items && Array.isArray(studentsData.items)) {
-                profiles = studentsData.items;
-            } else if (studentsData && studentsData.students && Array.isArray(studentsData.students)) {
-                profiles = studentsData.students;
-            } else if (studentsData && typeof studentsData === 'object') {
-                for (const key of Object.keys(studentsData)) {
-                    if (Array.isArray(studentsData[key]) && studentsData[key].length > 0 && typeof studentsData[key][0] === 'object') {
-                        profiles = studentsData[key];
-                        addLog(`[DEBUG] Найден массив учеников в поле '${key}'`, 'info');
-                        break;
-                    }
-                }
-            }
+        let validStudents = [];
+        let marksData = null;
+        let schoolYearUsed = null;
 
-            // Безопасная фильтрация — не только по person_id
-            const validStudents = profiles.filter(s => s && (s.id || s.person_id || s.student_id));
+        for (const currentAy of ayCandidates) {
+            if (tried.has(currentAy)) continue;
+            tried.add(currentAy);
 
-            if (validStudents.length === 0) {
-                addLog(`В группе не найдено учеников. Всего профилей: ${profiles.length}`, 'error');
-                if (profiles.length > 0) {
-                    addLog(`[DEBUG] Первый профиль: ${JSON.stringify(profiles[0]).substring(0, 200)}`, 'error');
-                }
-                return;
-            }
-            addLog(`Загружено учеников: ${validStudents.length}`);
-
-            // 2. Загрузка оценок за выбранный период
-            const dates = getTrimesterDates(state.trimester);
-            addLog(`Загружаю оценки за период: ${dates.start} — ${dates.end}...`);
-            const marksData = await apiFetch(`/api/ej/core/teacher/v1/marks?group_ids=${groupId}&created_at_from=${dates.start}&created_at_to=${dates.end}&with_non_numeric_entries=true&per_page=3000&page=1`);
+            addLog(`[Попытка] academic_year_id=${currentAy} для student_profiles...`);
             
-            const studentIds = validStudents.map(s => String(s.id));
-            const avgMap = computeAverages(marksData, studentIds);
-            addLog(`Вычислен средний балл за период для ${Object.keys(avgMap).filter(k => avgMap[k] !== null).length} учеников`);
-
-            // 3. Выбор period_id
-            addLog('Определяю текущий период для soft skills...');
-            const firstPersonId = validStudents[0].person_id || validStudents[0].id;
-            const periodId = await getPeriodId(firstPersonId);
-            
-            if (!periodId) {
-                addLog('Не удалось определить period_id. МЭШ не настроен на проведение анкетирования.', 'error');
-                return;
-            }
-            state.periodId = periodId;
-            addLog(`Используется period_id: ${periodId}`, 'success');
-
-            // 4. Построение массива учеников для превью
-            addLog('Рассчитываю автоматические оценки...');
-            const studentsList = [];
-            for (const s of validStudents) {
-                const name = [s.last_name, s.first_name, s.middle_name].filter(Boolean).join(' ') || `ID ${s.id}`;
-                const avg = avgMap[s.id];
+            try {
+                const url = `/api/ej/core/teacher/v1/student_profiles?academic_year_id=${currentAy}&group_ids=${groupId}&with_final_marks=true&per_page=150&page=1`;
+                addLog(`[API] URL: ${CONFIG.apiBase}${url}`, 'info');
                 
-                const answers = {};
-                ['self_org', 'self_edu', 'self_reg', 'comm'].forEach(cat => {
-                    let qId = 1;
-                    if (cat === 'self_edu') qId = 3;
-                    else if (cat === 'self_reg') qId = 5;
-                    else if (cat === 'comm') qId = 11;
-                    
-                    answers[cat] = getAnswerByScore(avg, qId, s.person_id || s.id);
-                });
+                const studentsData = await apiFetch(url, {}, false);
 
-                studentsList.push({
-                    id: s.id,
-                    person_id: s.person_id || s.id,
-                    name: name,
-                    avg: avg,
-                    answers: answers,
-                    selected: true,
-                    status: null
-                });
+                // Логируем полный ответ
+                addLog(`[DEBUG] Тип ответа: ${Array.isArray(studentsData) ? 'array' : typeof studentsData}`, 'info');
+                addLog(`[DEBUG] Ответ (первые 300 символов): ${JSON.stringify(studentsData).substring(0, 300)}`, 'info');
+                if (typeof studentsData === 'object' && studentsData !== null) {
+                    addLog(`[DEBUG] Ключи: ${Object.keys(studentsData).join(', ')}`, 'info');
+                }
+
+                let profiles = [];
+                if (Array.isArray(studentsData)) {
+                    profiles = studentsData;
+                } else if (studentsData && typeof studentsData === 'object') {
+                    for (const key of Object.keys(studentsData)) {
+                        if (Array.isArray(studentsData[key])) {
+                            profiles = studentsData[key];
+                            addLog(`[DEBUG] Найден массив в поле '${key}' — ${profiles.length} элементов`, 'info');
+                            if (profiles.length > 0) {
+                                addLog(`[DEBUG] Ключи элемента: ${Object.keys(profiles[0]).join(', ')}`, 'info');
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                validStudents = profiles.filter(s => s && (s.id || s.person_id || s.student_id));
+
+                if (validStudents.length > 0) {
+                    schoolYearUsed = currentAy;
+                    addLog(`✅ academic_year_id=${currentAy} → ${validStudents.length} учеников`, 'success');
+                    break;
+                } else {
+                    addLog(`❌ academic_year_id=${currentAy} — 0 учеников (profiles=${profiles.length})`, 'warning');
+                    if (profiles.length > 0) {
+                        addLog(`[DEBUG] Первый элемент: ${JSON.stringify(profiles[0]).substring(0, 300)}`, 'warning');
+                    }
+                }
+            } catch (e) {
+                addLog(`❌ academic_year_id=${currentAy} — ошибка: ${e.message.substring(0, 100)}`, 'warning');
             }
-
-            state.students = studentsList.sort((a,b) => a.name.localeCompare(b.name));
-            addLog('Анализ завершён. Перейдите во вкладку «Превью» для проверки.', 'success');
-            switchTab('preview');
-
-        } catch (e) {
-            addLog(`Ошибка при анализе: ${e.message}`, 'error');
         }
+
+        if (validStudents.length === 0) {
+            addLog('👎 Не удалось найти учеников ни с одним academic_year_id.', 'error');
+            addLog('Проверьте: 1) ID группы корректен 2) В настройках можно указать academic_year_id вручную', 'info');
+            return;
+        }
+
+        addLog(`Найдено учеников: ${validStudents.length}`);
+
+        // 2. Загрузка оценок за выбранный период
+        try {
+            const dates = getTrimesterDates(state.trimester);
+            addLog(`Загружаю оценки за период: ${dates.start} — ${dates.end} (school_year=${schoolYearUsed})...`);
+            marksData = await apiFetch(`/api/ej/core/teacher/v1/marks?group_ids=${groupId}&created_at_from=${dates.start}&created_at_to=${dates.end}&with_non_numeric_entries=true&per_page=3000&page=1`);
+        } catch (e) {
+            addLog(`Ошибка загрузки оценок: ${e.message} (продолжаем без среднего балла)`, 'warning');
+        }
+
+        const studentIds = validStudents.map(s => String(s.id));
+        const avgMap = marksData ? computeAverages(marksData, studentIds) : {};
+        addLog(`Средний балл: ${Object.keys(avgMap).filter(k => avgMap[k] !== null).length} учеников`);
+
+        // 3. Выбор period_id
+        addLog('Определяю период soft skills...');
+        const firstPersonId = validStudents[0].person_id || validStudents[0].id;
+        const periodId = await getPeriodId(firstPersonId);
+        if (!periodId) {
+            addLog('⚠️ Нет period_id (МЭШ не настроен на анкетирование)', 'error');
+        } else {
+            state.periodId = periodId;
+            addLog(`✅ period_id: ${periodId}`, 'success');
+        }
+
+        // 4. Построение массива
+        addLog('Рассчитываю оценки...');
+        const studentsList = [];
+        for (const s of validStudents) {
+            const name = [s.last_name, s.first_name, s.middle_name].filter(Boolean).join(' ') || s.short_name || s.user_name || `ID ${s.id}`;
+            const avg = avgMap[s.id];
+
+            const answers = {};
+            ['self_org', 'self_edu', 'self_reg', 'comm'].forEach(cat => {
+                let qId = 1;
+                if (cat === 'self_edu') qId = 3;
+                else if (cat === 'self_reg') qId = 5;
+                else if (cat === 'comm') qId = 11;
+                answers[cat] = getAnswerByScore(avg, qId, s.person_id || s.id);
+            });
+
+            studentsList.push({
+                id: s.id,
+                person_id: s.person_id || s.id,
+                name: name,
+                avg: avg,
+                answers: answers,
+                selected: true,
+                status: null
+            });
+        }
+
+        state.students = studentsList.sort((a,b) => a.name.localeCompare(b.name));
+        addLog(`✅ Анализ завершён (school_year=${schoolYearUsed}, учеников=${state.students.length})`, 'success');
+        switchTab('preview');
     }
 
     function computeAverages(marksData, studentIds) {
