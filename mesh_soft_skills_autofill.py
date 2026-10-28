@@ -1,284 +1,271 @@
 #!/usr/bin/env python3
 """
-МЭШ — Автозаполнение Soft Skills
-==================================
-Автоматически заполняет оценку «soft skills» для всех учеников
-на основе их среднего балла по предмету.
+МЭШ — автозаполнение Soft Skills (консольная версия)
+====================================================
+Сам находит учителя, учебный год, текущий период soft skills и все группы
+учителя по расписанию (уроки-замены не учитываются). Средний балл ученика
+считается по оценкам за текущий период по всем группам учителя.
 
-Как использовать:
-  1. Открой school.mos.ru → F12 → Network → обнови страницу
-  2. Скопируй Authorization: Bearer eyJ...  (из любого запроса)
-  3. Скопируй Profile-Id: 17905177  (из заголовков запроса)
-  4. Запусти: python3 mesh_soft_skills_autofill.py
-  5. Вставь токен и profile-id — скрипт сам найдёт твои группы
+Запуск:
+  python3 mesh_soft_skills_autofill.py              # только показать, что будет выставлено
+  python3 mesh_soft_skills_autofill.py --apply      # выставить тем, у кого ещё не заполнено
+  python3 mesh_soft_skills_autofill.py --apply --overwrite   # перезаписать всем
+
+Токен берётся из --token, переменной MESH_TOKEN или файла ~/.mesh_token,
+иначе спрашивается. Его можно скопировать из cookie aupd_token на school.mos.ru.
 
 Зависимости: pip install requests
 """
 
-import requests, json, sys, time, hashlib, warnings
+import argparse, datetime as dt, json, os, sys, time
 from collections import defaultdict
-warnings.filterwarnings("ignore")
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-BASE_URL = "https://school.mos.ru"
+import requests
 
-QUESTION_OFFSETS = {1:0.25,2:0.15,3:-0.35,4:-0.20,5:0.05,6:0.10,7:0.20,11:0.30,13:0.25,14:-0.30}
-THRESHOLDS = {"self_org":[4.6,3.7,3.0],"self_edu":[4.8,4.0,3.3],"self_reg":[4.6,3.7,3.0],"comm":[4.6,3.7,3.0]}
-QUESTION_CATEGORY = {1:"self_org",2:"self_org",3:"self_edu",4:"self_edu",5:"self_reg",6:"self_reg",7:"self_reg",11:"comm",13:"comm",14:"comm"}
-QUESTION_TEXT = {1:"Самоорганизация: ДЗ",2:"Самоорганизация: сроки",3:"Самообразование: интерес",4:"Самообразование: любознательность",5:"Саморегуляция: внимание",6:"Саморегуляция: самооценка",7:"Саморегуляция: дисциплина",11:"Коммуникация: слушает",13:"Коммуникация: вежливость",14:"Коммуникация: выступления"}
-ANSWER_TEXT = {1:"Никогда",2:"Редко",3:"Часто",4:"Всегда",5:"Затрудняюсь"}
+BASE = "https://school.mos.ru"
 
-def make_headers(token):
-    return {"Authorization":f"Bearer {token}","Accept":"application/json","X-Mes-Subsystem":"teacherweb","Content-Type":"application/json","User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+# Пороги среднего балла для «Почти всегда», «Часто»; ниже — «Редко»
+THRESHOLDS = {
+    "Самоорганизация": (4.6, 3.7),
+    "Самообразование": (4.8, 4.0),
+    "Саморегуляция": (4.6, 3.7),
+    "Коммуникация": (4.6, 3.7),
+}
+DEFAULT_THRESHOLDS = (4.6, 3.7)
+# Сдвиг по вопросам: выступления и интерес вне программы — ниже, ДЗ и вежливость — выше
+QUESTION_OFFSETS = {1: 0.25, 2: 0.15, 3: -0.35, 4: -0.20, 5: 0.05, 6: 0.10, 7: 0.20, 11: 0.30, 13: 0.25, 14: -0.30}
+# Слабых учеников (в т.ч. только с двойками) оцениваем как троечников: «Почти никогда» не ставится
+MIN_AVG = 3.3
+ALWAYS, OFTEN, RARELY, UNSURE = 4, 3, 2, 5
+ANSWER_SHORT = {4: "В", 3: "Ч", 2: "Р", 1: "Н", 5: "?"}
 
-def api_get(token, path, params=None):
-    resp = requests.get(f"{BASE_URL}{path}", headers=make_headers(token), params=params, timeout=30, verify=False)
-    if resp.status_code == 401: print("\n  ❌ Токен истёк."); sys.exit(1)
-    resp.raise_for_status(); return resp.json()
 
-def api_post(token, path, data):
-    return requests.post(f"{BASE_URL}{path}", headers=make_headers(token), json=data, timeout=30, verify=False)
+class Mesh:
+    def __init__(self, token):
+        self.s = requests.Session()
+        self.s.headers.update({
+            "Authorization": f"Bearer {token}", "Accept": "application/json",
+            "X-Mes-Subsystem": "teacherweb", "User-Agent": "Mozilla/5.0",
+        })
+        self.token = token
 
-def get_student_name(s):
-    name = (s.get("short_name") or "").strip()
-    if not name or name == "None None": name = (s.get("user_name") or "").strip()
-    if not name: name = f"{s.get('last_name','')} {s.get('first_name','')}".strip()
-    return name or "Unknown"
-
-def compute_averages(marks_data, student_ids):
-    scores = defaultdict(list)
-    if isinstance(marks_data, list):
-        for m in marks_data:
-            sid = m.get("student_profile_id")
-            if sid not in student_ids: continue
+    def req(self, method, path, **kw):
+        for attempt in range(4):
             try:
-                val = m.get("values",[{}])[0].get("grade",{}).get("five")
-                if val is None: val = float(m.get("name",0))
-                if 2<=val<=5: scores[sid].append(val)
-            except: pass
-    return {sid: sum(vals)/len(vals) for sid,vals in scores.items() if vals}
+                r = self.s.request(method, BASE + path, timeout=90, **kw)
+            except requests.exceptions.RequestException:
+                time.sleep(2 + attempt * 2); continue
+            if r.status_code in (502, 503, 504):
+                time.sleep(2 + attempt * 2); continue
+            if r.status_code == 401:
+                sys.exit("❌ Токен недействителен или истёк. Войдите в МЭШ заново и возьмите свежий aupd_token.")
+            r.raise_for_status()
+            return r.json() if r.content else None
+        raise RuntimeError(f"МЭШ не отвечает: {method} {path}")
 
-def get_period_id(token, person_id):
-    try:
-        p = api_get(token, "/api/soft_skills/v1/periods", {"student_person_id": person_id})
-        if isinstance(p,list) and p: return p[0].get("id")
-    except: pass
-    try:
-        c = api_get(token, "/api/soft_skills/v1/periods/checkCurrentPeriodTeacher", {"student_person_id": person_id})
-        if isinstance(c,dict): return c.get("period_id")
-    except: pass
-    return None
+    def get(self, path, **params):
+        return self.req("GET", path, params=params)
 
-def check_filled(token, person_id, period_id):
-    try:
-        r = requests.get(f"{BASE_URL}/api/soft_skills/v1/survey/teacherSurvey", headers=make_headers(token), verify=False, params={"student_person_id":person_id,"period_id":period_id}, timeout=10)
-        if r.status_code==200:
-            d = r.json()
-            if isinstance(d,dict) and d.get("answers") and len(d["answers"])>0: return True
-    except: pass
-    return False
 
-def get_answer(avg, qid, pid):
-    if avg is None: return 5
-    cat = QUESTION_CATEGORY[qid]; t = THRESHOLDS[cat]
-    seed = int(hashlib.md5(str(pid).encode()).hexdigest()[:8],16)
-    pv = ((seed+qid*100)%500-250)/1000
-    adj = avg+QUESTION_OFFSETS.get(qid,0)+pv
-    if adj>=t[0]: return 4
-    if adj>=t[1]: return 3
-    if adj>=t[2]: return 2
-    return 1
+def answer_for(avg, qid, category, person_id):
+    if avg is None:
+        return UNSURE
+    always, often = THRESHOLDS.get(category, DEFAULT_THRESHOLDS)
+    adj = max(avg, MIN_AVG) + QUESTION_OFFSETS.get(qid, 0) + noise(person_id, qid)
+    if adj >= always: return ALWAYS
+    if adj >= often: return OFTEN
+    return RARELY
 
-def get_my_groups_from_schedule(token, teacher_id):
-    """Получает группы учителя из расписания."""
-    print("  ⏳ Загружаю расписание...")
-    r = requests.get(f"{BASE_URL}/api/ej/plan/teacher/v1/schedule_items", headers=make_headers(token), verify=False, params={
-        "academic_year_id":13,
-        "teacher_id":teacher_id,
-        "from":"2025-09-01",
-        "to":"2026-05-31",
-        "with_group_class_subject_info":"true",
-        "page":1,
-        "per_page":2000,
-    }, timeout=30)
-    if r.status_code!=200:
-        print(f"  ❌ Ошибка расписания: HTTP {r.status_code}")
-        return []
-    data = r.json()
-    if not isinstance(data, list):
-        print(f"  ❌ Неверный формат ответа")
-        return []
-    
-    groups = {}
-    for item in data:
-        gid = item.get("group_id")
-        gname = item.get("group_name","")
-        subj = item.get("subject_name","")
-        if gid and gid not in groups:
-            groups[gid] = {"name": gname, "subject": subj}
-    
-    if not groups:
-        print("  ❌ В расписании нет уроков. Проверьте Profile-Id.")
-        return []
-    
-    result = [(gid, info["name"], info["subject"]) for gid, info in groups.items()]
-    return sorted(result, key=lambda x: x[1])
+
+def noise(person_id, qid):
+    """Постоянная для ученика и вопроса поправка от -0.25 до +0.25 (FNV-1a, как в JS-версии)."""
+    h = 0x811C9DC5
+    for b in f"{person_id}:{qid}".encode():
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return (h % 500 - 250) / 1000
+
+
+def parse_date(v):
+    if isinstance(v, list): return dt.date(*v[:3])
+    if "." in v: d, m, y = v.split(".")[:3]; return dt.date(int(y), int(m), int(d[:2]))
+    return dt.date.fromisoformat(v[:10])
+
+
+def find_teacher(m):
+    sess = m.req("POST", "/api/ej/acl/v1/sessions", json={"auth_token": m.token})
+    prof = next((p for p in sess.get("profiles", []) if p.get("type") == "teacher"), None)
+    if not prof:
+        sys.exit("❌ У этого аккаунта нет профиля учителя.")
+    m.s.headers["Profile-Id"] = str(prof["id"])
+    name = " ".join(filter(None, [sess.get("last_name"), sess.get("first_name"), sess.get("middle_name")]))
+    return prof["id"], name
+
+
+def current_year(m):
+    years = m.get("/api/ej/core/teacher/v1/academic_years")
+    return next(y for y in years if y.get("current_year"))
+
+
+def my_groups(m, teacher_id, year):
+    """Группы, где учитель ведёт свои уроки (без замен)."""
+    frm = year["begin_date"][:10]
+    to = min(parse_date(year["end_date"]), dt.date.today() + dt.timedelta(days=60)).isoformat()
+    groups, page = {}, 1
+    while True:
+        items = m.get("/api/ej/plan/teacher/v1/schedule_items", academic_year_id=year["id"], teacher_id=teacher_id,
+                      **{"from": frm, "to": to}, with_group_class_subject_info="true", page=page, per_page=300)
+        for it in items:
+            if it.get("replaced") or it.get("replaced_teacher_id") or not it.get("group_id"):
+                continue
+            groups.setdefault(it["group_id"], {"id": it["group_id"], "name": (it.get("group_name") or "").strip(),
+                                               "subject": it.get("subject_name") or ""})
+        if len(items) < 300:
+            break
+        page += 1
+    return sorted(groups.values(), key=lambda g: g["name"])
+
+
+def collect(m, year, groups, log=print):
+    """Ученики по всем группам (один человек — одна анкета) + средний балл за текущий период."""
+    students = {}  # person_id -> info
+    by_profile = {}
+    for g in groups:
+        profiles = m.get("/api/ej/core/teacher/v1/student_profiles", academic_year_id=year["id"],
+                         group_ids=g["id"], per_page=300, page=1)
+        g["count"] = 0
+        for s in profiles:
+            pid = s.get("person_id")
+            if not pid:
+                continue
+            g["count"] += 1
+            st = students.setdefault(pid, {
+                "person_id": pid, "name": (s.get("user_name") or s.get("short_name") or f"ID {s['id']}").strip(),
+                "class": (s.get("class_unit") or {}).get("name", ""),
+                "parallel": (s.get("class_unit") or {}).get("class_level_id"),
+                "groups": [], "marks": [],
+            })
+            st["groups"].append(g["name"])
+            by_profile[s["id"]] = st
+        log(f"  {g['name']}: {g['count']} уч.")
+
+    # Текущий период и «уже заполнено» — отдельно для каждого ученика
+    periods = {}
+    for st in students.values():
+        cur = m.get("/api/soft_skills/v1/periods/checkCurrentPeriodTeacher", student_person_id=st["person_id"])
+        st["period_id"] = cur.get("period_id")
+        st["filled"] = bool(cur.get("answers_exists"))
+        if st["period_id"] and st["period_id"] not in periods:
+            lst = m.get("/api/soft_skills/v1/periods", student_person_id=st["person_id"])
+            for p in lst.get("periods", []):
+                periods[p["period_id"]] = p
+    for st in students.values():
+        st["period"] = periods.get(st["period_id"])
+
+    # Оценки за период каждого ученика
+    for g in groups:
+        marks = m.get("/api/ej/core/teacher/v1/marks", group_ids=g["id"],
+                      created_at_from=parse_date(year["begin_date"]).strftime("%d.%m.%Y"),
+                      created_at_to=dt.date.today().strftime("%d.%m.%Y"),
+                      with_non_numeric_entries="false", per_page=5000, page=1)
+        for mk in marks:
+            st = by_profile.get(mk.get("student_profile_id"))
+            if not st or not st["period"]:
+                continue
+            try:
+                five = mk["values"][0]["grade"]["five"]
+                day = parse_date(mk.get("date") or mk["created_at"])
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+            p = st["period"]
+            if five and parse_date(p["begin_date"]) <= day <= parse_date(p["end_date"]):
+                st["marks"].append((float(five), mk.get("weight") or 1))
+    for st in students.values():
+        w = sum(x[1] for x in st["marks"])
+        st["avg"] = sum(v * k for v, k in st["marks"]) / w if w else None
+    return students
+
+
+def build_answers(m, students):
+    questions = {}
+    for st in students.values():
+        par = st["parallel"]
+        if par not in questions:
+            qa = m.get("/api/soft_skills/v1/survey/questionsAnswers", **({"parallel": par} if par else {}))
+            questions[par] = [(q["question_id"], grp["question_group_name"])
+                              for grp in qa["question_groups"] for q in grp["questions"]]
+        st["answers"] = {qid: answer_for(st["avg"], qid, cat, st["person_id"]) for qid, cat in questions[par]}
+
 
 def main():
-    print("="*65)
-    print("  МЭШ — АВТОЗАПОЛНЕНИЕ SOFT SKILLS")
-    print("="*65)
-    
-    token = input("\n🔑 Bearer токен (из F12 → Network):\n  ").strip()
-    if not token: print("Токен пустой"); sys.exit(1)
-    
-    pid_input = input("👤 Profile-Id (из заголовков запроса):\n  ").strip()
-    if not pid_input or not pid_input.isdigit():
-        print("Profile-Id должен быть числом. Ищи в Request Headers → Profile-Id")
-        sys.exit(1)
-    teacher_id = int(pid_input)
-    
-    print("\n⏳ Получаю ваши группы из расписания...")
-    my_groups = get_my_groups_from_schedule(token, teacher_id)
-    
-    if not my_groups:
-        print("❌ Не найдено групп. Проверьте Profile-Id.")
-        sys.exit(1)
-    
-    # Группируем по предметам
-    subjects = defaultdict(list)
-    for gid, gname, subj in my_groups:
-        subj_name = subj or (gname.split()[0] if gname else "?")
-        subjects[subj_name].append((gid, gname))
-    
-    print(f"\n✅ Найдено {len(my_groups)} групп, {len(subjects)} предметов")
-    
-    # Выбор предмета
-    subj_list = sorted(subjects.keys(), key=lambda x: x.lower())
-    print(f"\n📚 ВАШИ ПРЕДМЕТЫ:")
-    print("-"*50)
-    for i, subj in enumerate(subj_list, 1):
-        print(f"  {i}. {subj} ({len(subjects[subj])} групп)")
-    
-    print(f"\n  {'='*50}")
-    print(f"  🎯 Если у вас один предмет — выбран автоматически")
-    if len(subj_list) == 1:
-        selected_subj = subj_list[0]
-        selected_groups = subjects[selected_subj]
-        print(f"     Предмет: {selected_subj}")
-    else:
-        choice = input(f"\nВыберите предмет (1-{len(subj_list)}): ").strip()
-        try:
-            idx = int(choice)-1
-            if 0<=idx<len(subj_list):
-                selected_subj = subj_list[idx]
-                selected_groups = subjects[selected_subj]
-            else: print("Неверный выбор"); sys.exit(1)
-        except: print("Неверный ввод"); sys.exit(1)
-    
-    print(f"\n📋 ГРУППЫ ПО ПРЕДМЕТУ «{selected_subj}»:")
-    for i, (gid, gname) in enumerate(selected_groups, 1):
-        print(f"  {i:2d}. [{gid}] {gname}")
-    
-    if len(selected_groups) <= 5:
-        confirm = input(f"\nЗаполнить все {len(selected_groups)} групп? (Enter/да, n/нет): ").strip().lower()
-        if confirm != "n":
-            chosen = selected_groups
-        else:
-            sys.exit(0)
-    else:
-        print(f"\nВыберите группы для заполнения:")
-        print(f"  1 — все {len(selected_groups)} групп")
-        print(f"  2 — выбрать по номерам (1,3,5-8)")
-        sel = input("> ").strip()
-        chosen = []
-        if sel == "1":
-            chosen = selected_groups
-        elif sel == "2":
-            parts = input("Номера групп: ").strip().split()
-            for part in parts:
-                if "-" in part:
-                    a,b = part.split("-")
-                    for n in range(int(a),int(b)+1):
-                        if 1<=n<=len(selected_groups): chosen.append(selected_groups[n-1])
-                else:
-                    try:
-                        n = int(part)
-                        if 1<=n<=len(selected_groups): chosen.append(selected_groups[n-1])
-                    except: pass
-        if not chosen: print("❌ Нет выбранных групп"); sys.exit(1)
-    
-    print(f"\n✅ Выбрано групп: {len(chosen)}")
-    input("Нажмите Enter для начала заполнения...")
-    
-    # ===== ЗАПОЛНЕНИЕ =====
-    all_results = []
-    total_students = total_ok = total_skip = total_fail = 0
-    
-    for gid, gname in chosen:
-        print(f"\n📁 [{gid}] {gname}")
-        try:
-            students = api_get(token, "/api/ej/core/teacher/v1/student_profiles", {"academic_year_id":13,"group_ids":gid,"with_final_marks":"true","per_page":150,"page":1})
-        except Exception as e:
-            print(f"  ❌ {e}"); continue
-        
-        profiles = students if isinstance(students,list) else students.get("items",[])
-        valid = [s for s in profiles if s.get("person_id")]
-        if not valid: print(f"  ⏭️ нет учеников"); continue
-        
-        sids_set = {s["id"] for s in valid}
-        print(f"  👥 {len(valid)} уч.")
-        
-        averages = {}
-        try:
-            marks = api_get(token, "/api/ej/core/teacher/v1/marks", {"group_ids":gid,"created_at_from":"01.09.2025","created_at_to":"31.08.2026","with_non_numeric_entries":"true","per_page":3000,"page":1})
-            if isinstance(marks,list) and marks: averages = compute_averages(marks, sids_set)
-        except: pass
-        if not averages:
-            for s in valid:
-                nums = []
-                for m in (s.get("final_marks",s.get("marks",[]))):
-                    try:
-                        v = int(m.get("value",m.get("mark",0)))
-                        if 2<=v<=5: nums.append(v)
-                    except: pass
-                if nums: averages[s["id"]] = sum(nums)/len(nums)
-        
-        print(f"  📊 оценок: {len(averages)}/{len(valid)}")
-        
-        period_id = get_period_id(token, valid[0]["person_id"])
-        if not period_id: print(f"  ⚠️ нет period_id"); continue
-        
-        g_ok=g_skip=0
-        for s in valid:
-            name = get_student_name(s)
-            avg = averages.get(s["id"])
-            answers = {str(q): get_answer(avg,q,s["person_id"]) for q in QUESTION_CATEGORY}
-            if check_filled(token, s["person_id"], period_id): g_skip+=1; continue
-            ans_list = [{"question_id":q,"answer_id":answers[q]} for q in ["1","2","3","4","5","6","7","11","13","14"]]
+    ap = argparse.ArgumentParser(description="Автозаполнение soft skills в МЭШ")
+    ap.add_argument("--apply", action="store_true", help="выставить (без флага — только показать)")
+    ap.add_argument("--overwrite", action="store_true", help="перезаписать уже заполненные анкеты")
+    ap.add_argument("--token", help="aupd_token из cookies school.mos.ru")
+    ap.add_argument("--report", default="soft_skills_report.json", help="куда сохранить отчёт")
+    a = ap.parse_args()
+
+    token = a.token or os.environ.get("MESH_TOKEN")
+    path = os.path.expanduser("~/.mesh_token")
+    if not token and os.path.exists(path):
+        token = open(path).read().strip()
+    if not token:
+        token = input("Токен (cookie aupd_token с school.mos.ru): ").strip()
+    m = Mesh(token)
+
+    teacher_id, teacher_name = find_teacher(m)
+    year = current_year(m)
+    print(f"👤 {teacher_name} (профиль {teacher_id}), учебный год {year['name']}")
+
+    groups = my_groups(m, teacher_id, year)
+    if not groups:
+        sys.exit("❌ В расписании нет ваших уроков в этом учебном году.")
+    print(f"📚 Ваши группы ({len(groups)}):")
+    students = collect(m, year, groups)
+    build_answers(m, students)
+
+    pnames = {(s["period"] or {}).get("period_name") for s in students.values()}
+    print(f"\n👥 Учеников: {len(students)} (одна анкета на ученика по всем вашим предметам); период: {', '.join(sorted(filter(None, pnames)))}")
+    by_class = defaultdict(list)
+    for st in students.values():
+        by_class[st["class"]].append(st)
+    for cls in sorted(by_class, key=lambda c: (len(c), c)):
+        lst = sorted(by_class[cls], key=lambda s: s["name"])
+        print(f"\n— {cls} ({len(lst)})")
+        for st in lst:
+            avg = f"{st['avg']:.2f}" if st["avg"] is not None else " —  "
+            ans = "".join(ANSWER_SHORT[v] for _, v in sorted(st["answers"].items()))
+            flag = "  [уже заполнено]" if st["filled"] else ""
+            print(f"   {avg}  {ans}  {st['name']}{flag}")
+
+    todo = [s for s in students.values() if s["period_id"] and (a.overwrite or not s["filled"])]
+    no_period = sum(1 for s in students.values() if not s["period_id"])
+    print(f"\nК выставлению: {len(todo)}; уже заполнено: {sum(s['filled'] for s in students.values())}; без периода: {no_period}")
+    print("Ответы: В — почти всегда, Ч — часто, Р — редко, ? — нет оценок за период (затрудняюсь ответить)")
+
+    ok = fail = 0
+    if a.apply:
+        for i, st in enumerate(todo, 1):
+            body = {"student_person_id": st["person_id"], "period_id": st["period_id"],
+                    "answers": [{"question_id": q, "answer_id": v} for q, v in st["answers"].items()]}
             try:
-                r = api_post(token, "/api/soft_skills/v1/survey", {"student_person_id":s["person_id"],"period_id":period_id,"answers":ans_list})
-                if r.ok: g_ok+=1
-                else: total_fail+=1
-            except: total_fail+=1
-            all_results.append({"group":gname,"name":name,"period_id":period_id,"avg":round(avg,2) if avg else None,"answers":answers})
+                m.req("POST", "/api/soft_skills/v1/survey", json=body)
+                ok += 1; st["result"] = "ok"
+            except Exception as e:
+                fail += 1; st["result"] = f"error: {e}"
+                print(f"   ❌ {st['name']}: {e}")
+            if i % 20 == 0 or i == len(todo):
+                print(f"   … {i}/{len(todo)}")
             time.sleep(0.15)
-        
-        total_ok+=g_ok; total_skip+=g_skip; total_students+=len(valid)
-        print(f"  ✅ {g_ok} заполнено, ⏭️ {g_skip} пропущено")
-    
-    print(f"\n{'='*50}")
-    print("📊 ИТОГИ")
-    print(f"  ✅ Заполнено:           {total_ok}")
-    print(f"  ⏭️ Уже было:            {total_skip}")
-    print(f"  ❌ Ошибок:              {total_fail}")
-    print(f"  📝 Всего учеников:      {total_students}")
-    print(f"  📚 Групп:               {len(chosen)}")
-    
-    report = {"thresholds":{c:f">={t[0]} Всегда, >={t[1]} Часто, >={t[2]} Редко, <{t[2]} Никогда" for c,t in THRESHOLDS.items()},"question_offsets":QUESTION_OFFSETS,"answer_map":ANSWER_TEXT,"questions":QUESTION_TEXT,"students":all_results}
-    with open("soft_skills_answers.json","w",encoding="utf-8") as f: json.dump(report,f,ensure_ascii=False,indent=2)
-    print(f"📁 Отчёт: soft_skills_answers.json")
+        print(f"\n✅ Выставлено: {ok}, ошибок: {fail}")
+    else:
+        print("\n(Ничего не отправлено. Запустите с --apply, чтобы выставить.)")
+
+    with open(a.report, "w", encoding="utf-8") as f:
+        json.dump({"teacher": teacher_name, "year": year["name"], "groups": groups,
+                   "students": [{k: v for k, v in s.items() if k != "marks"} | {"marks": len(s["marks"])}
+                                for s in students.values()]}, f, ensure_ascii=False, indent=1, default=str)
+    print(f"📁 Отчёт: {a.report}")
+
 
 if __name__ == "__main__":
     main()

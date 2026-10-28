@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "МЭШ Soft Skills — автозаполнение",
+  "version": "3.0",
+  "description": "Выставляет оценку учебных умений (soft skills) всем ученикам учителя в МЭШ по их среднему баллу.",
+  "icons": { "16": "icon16.png", "48": "icon48.png", "128": "icon128.png" },
+  "action": { "default_title": "Soft Skills: открыть панель", "default_icon": { "16": "icon16.png", "48": "icon48.png" } },
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    { "matches": ["https://school.mos.ru/*"], "js": ["softskills.js"], "run_at": "document_idle" }
+  ]
+}
